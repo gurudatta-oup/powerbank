@@ -3,6 +3,10 @@ name: Load Test — 20 Workers × 10K = 200K Requests
 on:
   workflow_dispatch:
     inputs:
+      test_url:
+        description: "Target URL (overrides TEST_URL repo variable if provided)"
+        required: false
+        default: ""
       requests_per_worker:
         description: "Requests per worker  [20 workers → 20× total]"
         required: false
@@ -17,10 +21,16 @@ on:
         default: "10"
 
 # ---------------------------------------------------------------------------
-# Set TEST_URL as a GitHub Actions Variable:
+# Two ways to set the target URL (pick either):
+#
+# Option A — type it at run time:
+#   Click "Run workflow" → fill in the "Target URL" input field
+#
+# Option B — set it once as a repo variable (no need to type every run):
 #   Repo → Settings → Secrets and variables → Actions → Variables → New
 #   Name: TEST_URL  |  Value: https://your-api.example.com/endpoint
 #
+# If both are set, the workflow input takes priority.
 # Default run: 20 workers × 10,000 req = 200,000 requests total (2 lakh)
 # ---------------------------------------------------------------------------
 
@@ -35,16 +45,25 @@ jobs:
         worker: [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20]
 
     steps:
-      - name: Validate TEST_URL is set
+      - name: Resolve target URL
         env:
-          TEST_URL: ${{ vars.TEST_URL }}
+          URL_FROM_INPUT: ${{ github.event.inputs.test_url }}
+          URL_FROM_VAR:   ${{ vars.TEST_URL }}
         run: |
-          if [ -z "$TEST_URL" ]; then
-            echo "::error::TEST_URL variable is not set."
-            echo "::error::Repo → Settings → Secrets and variables → Actions → Variables → Add TEST_URL"
+          if [ -n "$URL_FROM_INPUT" ]; then
+            echo "Using URL from workflow input"
+            RESOLVED="$URL_FROM_INPUT"
+          elif [ -n "$URL_FROM_VAR" ]; then
+            echo "Using URL from TEST_URL repo variable"
+            RESOLVED="$URL_FROM_VAR"
+          else
+            echo "::error::No URL provided."
+            echo "::error::Either enter a URL in the 'Target URL' field when running the workflow,"
+            echo "::error::or set TEST_URL in: Settings → Secrets and variables → Actions → Variables"
             exit 1
           fi
-          echo "Target: $TEST_URL"
+          echo "Target: $RESOLVED"
+          echo "RESOLVED_URL=$RESOLVED" >> "$GITHUB_ENV"
 
       # aiohttp is required for high-throughput async HTTP at 10K scale
       - name: Install aiohttp
@@ -52,7 +71,7 @@ jobs:
 
       - name: Run load test (async, 10K requests)
         env:
-          TEST_URL:    ${{ vars.TEST_URL }}
+          TEST_URL:    ${{ env.RESOLVED_URL }}
           WORKER_ID:   ${{ matrix.worker }}
           REQUESTS:    ${{ github.event.inputs.requests_per_worker || '10000' }}
           CONCURRENCY: ${{ github.event.inputs.concurrency || '200' }}
