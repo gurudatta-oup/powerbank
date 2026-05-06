@@ -1,0 +1,323 @@
+name: Load Test — 20 Workers × 10K = 200K Requests
+
+on:
+  workflow_dispatch:
+    inputs:
+      requests_per_worker:
+        description: "Requests per worker  [20 workers → 20× total]"
+        required: false
+        default: "10000"
+      concurrency:
+        description: "Concurrent async connections per worker"
+        required: false
+        default: "200"
+      timeout_seconds:
+        description: "Per-request timeout (seconds)"
+        required: false
+        default: "10"
+
+# ---------------------------------------------------------------------------
+# Set TEST_URL as a GitHub Actions Variable:
+#   Repo → Settings → Secrets and variables → Actions → Variables → New
+#   Name: TEST_URL  |  Value: https://your-api.example.com/endpoint
+#
+# Default run: 20 workers × 10,000 req = 200,000 requests total (2 lakh)
+# ---------------------------------------------------------------------------
+
+jobs:
+  # ── 1. Fire all 20 workers simultaneously ───────────────────────────────
+  load-test:
+    name: "Worker ${{ matrix.worker }}"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        worker: [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20]
+
+    steps:
+      - name: Validate TEST_URL is set
+        env:
+          TEST_URL: ${{ vars.TEST_URL }}
+        run: |
+          if [ -z "$TEST_URL" ]; then
+            echo "::error::TEST_URL variable is not set."
+            echo "::error::Repo → Settings → Secrets and variables → Actions → Variables → Add TEST_URL"
+            exit 1
+          fi
+          echo "Target: $TEST_URL"
+
+      # aiohttp is required for high-throughput async HTTP at 10K scale
+      - name: Install aiohttp
+        run: pip install aiohttp --quiet
+
+      - name: Run load test (async, 10K requests)
+        env:
+          TEST_URL:    ${{ vars.TEST_URL }}
+          WORKER_ID:   ${{ matrix.worker }}
+          REQUESTS:    ${{ github.event.inputs.requests_per_worker || '10000' }}
+          CONCURRENCY: ${{ github.event.inputs.concurrency || '200' }}
+          TIMEOUT:     ${{ github.event.inputs.timeout_seconds || '10' }}
+        run: |
+          python3 << 'PYEOF'
+          import os, json, time, asyncio, collections
+          import aiohttp
+
+          url         = os.environ["TEST_URL"]
+          worker_id   = int(os.environ["WORKER_ID"])
+          n_requests  = int(os.environ["REQUESTS"])
+          concurrency = int(os.environ["CONCURRENCY"])
+          timeout_sec = int(os.environ["TIMEOUT"])
+
+          PROGRESS_EVERY = max(500, n_requests // 20)   # ~20 progress lines total
+
+          print(f"[Worker {worker_id}] target      : {url}")
+          print(f"[Worker {worker_id}] requests    : {n_requests:,}")
+          print(f"[Worker {worker_id}] concurrency : {concurrency}")
+          print(f"[Worker {worker_id}] timeout     : {timeout_sec}s")
+          print(f"[Worker {worker_id}] starting...")
+
+          # Shared counters
+          completed  = 0
+          success    = 0
+          failed     = 0
+          latencies  = []
+          status_ctr = collections.Counter()
+          errors     = []   # keep first 50 unique errors
+
+          async def fire(session, req_num):
+              nonlocal completed, success, failed
+              t0 = time.perf_counter()
+              try:
+                  async with session.get(url) as resp:
+                      await resp.read()
+                      elapsed = round((time.perf_counter() - t0) * 1000)
+                      latencies.append(elapsed)
+                      status_ctr[resp.status] += 1
+                      if 200 <= resp.status < 400:
+                          success += 1
+                      else:
+                          failed += 1
+              except asyncio.TimeoutError:
+                  elapsed = round((time.perf_counter() - t0) * 1000)
+                  latencies.append(elapsed)
+                  status_ctr["TIMEOUT"] += 1
+                  failed += 1
+                  if len(errors) < 50:
+                      errors.append({"req": req_num, "error": "TimeoutError"})
+              except Exception as e:
+                  elapsed = round((time.perf_counter() - t0) * 1000)
+                  latencies.append(elapsed)
+                  status_ctr["ERROR"] += 1
+                  failed += 1
+                  if len(errors) < 50:
+                      errors.append({"req": req_num, "error": str(e)[:120]})
+              finally:
+                  completed += 1
+                  if completed % PROGRESS_EVERY == 0 or completed == n_requests:
+                      done_pct   = round(completed / n_requests * 100)
+                      ok_pct     = round(success / completed * 100) if completed else 0
+                      avg_so_far = round(sum(latencies) / len(latencies)) if latencies else 0
+                      print(f"  [{worker_id}] {completed:>6,}/{n_requests:,}  "
+                            f"({done_pct:>3}%)  ok={ok_pct}%  avg={avg_so_far}ms")
+
+          async def main():
+              timeout   = aiohttp.ClientTimeout(total=timeout_sec)
+              connector = aiohttp.TCPConnector(
+                  limit=concurrency,
+                  limit_per_host=concurrency,
+                  ssl=False,        # disable SSL verify for speed; remove if needed
+              )
+              headers = {
+                  "User-Agent": f"GH-LoadTest/Worker-{worker_id}",
+                  "Accept":     "*/*",
+              }
+              async with aiohttp.ClientSession(
+                  connector=connector,
+                  timeout=timeout,
+                  headers=headers,
+              ) as session:
+                  tasks = [fire(session, i) for i in range(1, n_requests + 1)]
+                  await asyncio.gather(*tasks)
+
+          wall_start = time.perf_counter()
+          asyncio.run(main())
+          wall_ms = round((time.perf_counter() - wall_start) * 1000)
+
+          # ── Compute percentile stats ───────────────────────────────────
+          lat_sorted = sorted(latencies)
+          n          = len(lat_sorted)
+
+          def pct(p):
+              return lat_sorted[max(0, int(n * p / 100) - 1)] if n else 0
+
+          stats = {
+              "min": lat_sorted[0]  if n else 0,
+              "p50": pct(50),
+              "p75": pct(75),
+              "p90": pct(90),
+              "p95": pct(95),
+              "p99": pct(99),
+              "max": lat_sorted[-1] if n else 0,
+              "avg": round(sum(lat_sorted) / n) if n else 0,
+          }
+          rps = round(n / (wall_ms / 1000), 1) if wall_ms else 0
+
+          print()
+          print(f"[Worker {worker_id}] ════════════════════════════════")
+          print(f"  Total      : {n:,}  (target {n_requests:,})")
+          print(f"  Success    : {success:,}  ({round(success/n*100) if n else 0}%)")
+          print(f"  Failed     : {failed:,}")
+          print(f"  Throughput : {rps} req/s")
+          print(f"  Wall time  : {wall_ms:,}ms  ({round(wall_ms/1000,1)}s)")
+          print(f"  Latency    : "
+                f"min={stats['min']}ms  avg={stats['avg']}ms  "
+                f"p50={stats['p50']}ms  p95={stats['p95']}ms  "
+                f"p99={stats['p99']}ms  max={stats['max']}ms")
+          print(f"  Status codes: {dict(sorted((str(k), v) for k,v in status_ctr.items()))}")
+          print(f"[Worker {worker_id}] ════════════════════════════════")
+
+          # Save summary only — not 10K raw rows (would bloat artifacts)
+          payload = {
+              "worker":         worker_id,
+              "url":            url,
+              "total":          n,
+              "success":        success,
+              "failed":         failed,
+              "error_rate_pct": round(failed / n * 100, 2) if n else 100,
+              "rps":            rps,
+              "wall_ms":        wall_ms,
+              "latency":        stats,
+              "status_codes":   {str(k): v for k, v in status_ctr.items()},
+              "sample_errors":  errors[:20],
+          }
+          with open("results.json", "w") as f:
+              json.dump(payload, f, indent=2)
+
+          # Fail step if error rate > 20%
+          if payload["error_rate_pct"] > 20:
+              print(f"::error::Worker {worker_id}: "
+                    f"error rate {payload['error_rate_pct']}% > 20% threshold")
+              raise SystemExit(1)
+          PYEOF
+
+      - name: Upload worker results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: worker-${{ matrix.worker }}-results
+          path: results.json
+          retention-days: 7
+
+  # ── 2. Aggregate all 20 workers → final report ──────────────────────────
+  aggregate:
+    name: "Aggregate Results (200K total)"
+    runs-on: ubuntu-latest
+    needs: load-test
+    if: always()
+
+    steps:
+      - name: Download all worker artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Aggregate and report
+        run: |
+          python3 << 'PYEOF'
+          import json, glob
+          from collections import Counter
+
+          files = sorted(glob.glob("artifacts/*/results.json"))
+          if not files:
+              print("No result files found.")
+              raise SystemExit(1)
+
+          workers = []
+          for f in files:
+              with open(f) as fh:
+                  workers.append(json.load(fh))
+
+          total     = sum(w["total"]   for w in workers)
+          success   = sum(w["success"] for w in workers)
+          failed    = sum(w["failed"]  for w in workers)
+          total_rps = round(sum(w["rps"] for w in workers), 1)
+          erp       = round(failed / total * 100, 2) if total else 0
+
+          def wavg(key):
+              return round(sum(w["latency"][key] * w["total"] for w in workers) / total) if total else 0
+
+          gmin = min(w["latency"]["min"] for w in workers)
+          gmax = max(w["latency"]["max"] for w in workers)
+          gavg = wavg("avg")
+          gp95 = wavg("p95")
+          gp99 = wavg("p99")
+
+          codes = Counter()
+          for w in workers:
+              for k, v in w["status_codes"].items():
+                  codes[k] += v
+
+          url = workers[0]["url"] if workers else "—"
+
+          print()
+          print("╔══════════════════════════════════════════════════════╗")
+          print("║       LOAD TEST COMPLETE — AGGREGATE REPORT          ║")
+          print("╠══════════════════════════════════════════════════════╣")
+          print(f"║  URL            : {url[:50]:<50} ║")
+          print(f"║  Workers        : {len(workers):<50} ║")
+          print(f"║  Total requests : {total:,}{'':<44} ║")
+          print(f"║  Success        : {success:,} ({100-erp:.1f}%){'':<38} ║")
+          print(f"║  Failed         : {failed:,} ({erp:.2f}%){'':<39} ║")
+          print(f"║  Throughput     : {total_rps} req/s combined{'':<33} ║")
+          print("╠══════════════════════════════════════════════════════╣")
+          print(f"║  Latency (weighted avg across all workers)           ║")
+          print(f"║    min={gmin}ms  avg={gavg}ms  p95={gp95}ms  p99={gp99}ms  max={gmax}ms{'':<5} ║")
+          print(f"║  Status codes: {str(dict(sorted(codes.items())))[:54]:<54} ║")
+          print("╠══════════════════════════════════════════════════════╣")
+          print(f"║  {'Worker':>6}  {'Total':>7}  {'OK':>7}  {'Fail':>5}  {'RPS':>7}  {'Avg':>6}  {'P95':>6} ║")
+          print(f"║  {'──────':>6}  {'───────':>7}  {'───────':>7}  {'─────':>5}  {'───────':>7}  {'──────':>6}  {'──────':>6} ║")
+          for w in sorted(workers, key=lambda x: x["worker"]):
+              print(f"║  {w['worker']:>6}  {w['total']:>7,}  {w['success']:>7,}  "
+                    f"{w['failed']:>5,}  {w['rps']:>7}  "
+                    f"{w['latency']['avg']:>6}  {w['latency']['p95']:>6} ║")
+          print("╚══════════════════════════════════════════════════════╝")
+
+          all_errors = []
+          for w in workers:
+              for e in w.get("sample_errors", []):
+                  all_errors.append({**e, "worker": w["worker"]})
+          if all_errors:
+              print(f"\n  Sample errors ({len(all_errors)} shown):")
+              for e in all_errors[:10]:
+                  print(f"    Worker {e['worker']} req {e['req']}: {e['error']}")
+
+          summary = {
+              "url":            url,
+              "workers":        len(workers),
+              "total_requests": total,
+              "success":        success,
+              "failed":         failed,
+              "error_rate_pct": erp,
+              "total_rps":      total_rps,
+              "latency": {
+                  "min": gmin, "avg": gavg,
+                  "p95": gp95, "p99": gp99, "max": gmax,
+              },
+              "status_codes": dict(codes),
+          }
+          with open("summary.json", "w") as f:
+              json.dump(summary, f, indent=2)
+          print("\nSummary saved → summary.json")
+
+          if erp > 20:
+              print(f"::error::Overall error rate {erp}% exceeds 20% threshold")
+              raise SystemExit(1)
+          PYEOF
+
+      - name: Upload aggregate summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: load-test-summary
+          path: summary.json
+          retention-days: 30
