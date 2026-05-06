@@ -104,7 +104,7 @@ jobs:
           errors     = []   # keep first 50 unique errors
 
           async def fire(session, req_num):
-              nonlocal completed, success, failed
+              global completed, success, failed
               t0 = time.perf_counter()
               try:
                   async with session.get(url) as resp:
