@@ -1,71 +1,371 @@
-name: System Stats Monitor
+name: System Stats Monitor — All Free Runners
+
 on:
   workflow_dispatch:
 
 jobs:
+  # ─────────────────────────────────────────────────────────────────────────────
+  # MONITOR — runs in parallel on all three free OS types
+  # ─────────────────────────────────────────────────────────────────────────────
   monitor:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+      fail-fast: false          # let all three finish even if one fails
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 10
 
     steps:
-      - name: Machine baseline
+
+      # ── LINUX ────────────────────────────────────────────────────────────────
+      - name: Monitor (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
         run: |
+          ITERS=30          # 30 × 10 s = 5 minutes
+          sum_ram=0; sum_cpu=0; sum_disk=0
+
+          # ── Baseline ─────────────────────────────────────────────────────────
+          CPU_MODEL=$(grep 'model name' /proc/cpuinfo | head -1 | cut -d: -f2 | xargs)
+          CORES=$(nproc)
+          RAM_TOT=$(awk '/^MemTotal:/{printf "%.1f",$2/1048576}' /proc/meminfo)
+          DISK_TOT=$(df -BG / | awk 'NR==2{gsub("G","",$2); print $2}')
+          OS_NAME=$(lsb_release -ds)
+
+          # SSD vs HDD via rotational flag (0 = SSD, 1 = HDD)
+          ROOT_DEV=$(df / | awk 'NR==2{print $1}' | sed 's|/dev/||; s|[0-9]*$||; s|p[0-9]*$||')
+          ROTA=$(cat /sys/block/${ROOT_DEV}/queue/rotational 2>/dev/null || echo "?")
+          case "$ROTA" in
+            0) DISK_TYPE="SSD" ;;
+            1) DISK_TYPE="HDD" ;;
+            *) DISK_TYPE="Unknown" ;;
+          esac
+
           echo "============================================"
-          echo " MACHINE BASELINE"
+          echo " MACHINE BASELINE (Linux)"
           echo "============================================"
-          echo "CPU model : $(grep 'model name' /proc/cpuinfo | head -1 | cut -d: -f2 | xargs)"
-          echo "CPU cores : $(nproc)"
-          echo "Total RAM : $(free -h | awk '/^Mem:/{print $2}')"
-          echo "Total disk: $(df -h / | awk 'NR==2{print $2}')"
-          echo "OS        : $(lsb_release -ds)"
-          echo "Kernel    : $(uname -r)"
+          echo "  CPU   : $CPU_MODEL"
+          echo "  Cores : $CORES"
+          echo "  RAM   : ${RAM_TOT} GiB total"
+          echo "  Disk  : ${DISK_TOT} GB total  [$DISK_TYPE]"
+          echo "  OS    : $OS_NAME"
           echo "============================================"
+          echo ""
 
-      - name: Poll every 10s for 5 minutes
-        run: |
-          ITERATIONS=30   # 30 x 10s = 5 minutes
+          # ── Poll loop ────────────────────────────────────────────────────────
+          for i in $(seq 1 $ITERS); do
+            ram_avail=$(awk '/^MemAvailable:/{printf "%.2f",$2/1048576}' /proc/meminfo)
+            # vmstat 1 1: take the 1-second sampled row (NR==3); $15 = idle %
+            cpu_idle=$(vmstat 1 1 | awk 'NR==3{print $15}')
+            cpu_used=$((100 - cpu_idle))
+            disk_avail=$(df -BG / | awk 'NR==2{gsub("G","",$4); print $4}')
 
-          for i in $(seq 1 $ITERATIONS); do
+            sum_ram=$(echo "$sum_ram + $ram_avail" | bc)
+            sum_cpu=$((sum_cpu + cpu_used))
+            sum_disk=$(echo "$sum_disk + $disk_avail" | bc)
 
-            echo ""
-            echo "--------------------------------------------"
-            echo " Poll $i / $ITERATIONS    $(date '+%H:%M:%S')"
-            echo "--------------------------------------------"
-
-            # ── RAM ──────────────────────────────────────
-            echo ""
-            echo "[RAM]"
-            free -h
-            echo ""
-            echo "[RAM DETAIL]"
-            awk '/^(MemTotal|MemFree|MemAvailable|Buffers|Cached|SwapTotal|SwapFree|SwapCached):/ \
-              {printf "  %-20s %8s kB\n", $1, $2}' /proc/meminfo
-
-            # ── CPU ──────────────────────────────────────
-            echo ""
-            echo "[CPU]"
-            echo "  Load avg (1m 5m 15m) : $(cut -d' ' -f1-3 /proc/loadavg)"
-            top -bn1 | grep "^%Cpu" | sed 's/^/  /'
-            echo "  Running processes    : $(ps aux | wc -l)"
-
-            # ── STORAGE ──────────────────────────────────
-            echo ""
-            echo "[STORAGE]"
-            df -h --output=source,size,used,avail,pcent,target \
-              | grep -v "^tmpfs\|^overlay\|^udev\|^/dev/loop\|Filesystem"
-            echo ""
-            echo "  /tmp usage : $(du -sh /tmp 2>/dev/null | cut -f1)"
-            echo "  /home usage: $(du -sh /home 2>/dev/null | cut -f1)"
-
-            # ── SWAP ─────────────────────────────────────
-            echo ""
-            echo "[SWAP]"
-            swapon --show 2>/dev/null || echo "  none"
-
+            echo "[$i/$ITERS] $(date '+%H:%M:%S')  RAM_avail=${ram_avail} GiB  CPU_used=${cpu_used}%  Disk_avail=${disk_avail} GB"
             sleep 10
           done
 
+          AVG_RAM=$(echo  "scale=2; $sum_ram  / $ITERS" | bc)
+          AVG_CPU=$(echo  "scale=1; $sum_cpu  / $ITERS" | bc)
+          AVG_DISK=$(echo "scale=1; $sum_disk / $ITERS" | bc)
+
           echo ""
+          echo "=== Linux Averages ==="
+          echo "  Avg RAM available : ${AVG_RAM} GiB"
+          echo "  Avg CPU used      : ${AVG_CPU}%"
+          echo "  Avg Disk available: ${AVG_DISK} GB"
+
+          # ── Save JSON for summary job ─────────────────────────────────────
+          CPU_ESC=$(echo "$CPU_MODEL" | sed 's/"/\\"/g')
+          OS_ESC=$(echo  "$OS_NAME"   | sed 's/"/\\"/g')
+          cat > stats.json <<ENDJSON
+          {
+            "runner":          "ubuntu-latest",
+            "cpu":             "$CPU_ESC",
+            "cores":           $CORES,
+            "ram_total_gib":   $RAM_TOT,
+            "disk_total_gb":   $DISK_TOT,
+            "disk_type":       "$DISK_TYPE",
+            "os":              "$OS_ESC",
+            "avg_ram_avail":   $AVG_RAM,
+            "avg_cpu_used":    $AVG_CPU,
+            "avg_disk_avail":  $AVG_DISK
+          }
+          ENDJSON
+
+      # ── macOS ────────────────────────────────────────────────────────────────
+      - name: Monitor (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          ITERS=30
+          sum_ram=0; sum_cpu=0; sum_disk=0
+
+          # ── Baseline ─────────────────────────────────────────────────────────
+          CPU_MODEL=$(sysctl -n machdep.cpu.brand_string)
+          CORES=$(sysctl -n hw.logicalcpu)
+          RAM_TOT=$(sysctl -n hw.memsize | awk '{printf "%.1f",$1/1073741824}')
+          DISK_TOT=$(df -BG / | awk 'NR==2{gsub("G","",$2); print $2}')
+          OS_NAME="macOS $(sw_vers -productVersion)"
+
+          # SSD detection via diskutil
+          if diskutil info / 2>/dev/null | grep -qi "solid state.*yes"; then
+            DISK_TYPE="SSD"
+          else
+            DISK_TYPE="HDD/Unknown"
+          fi
+
           echo "============================================"
-          echo " Monitor done — 5 minutes complete"
+          echo " MACHINE BASELINE (macOS)"
           echo "============================================"
+          echo "  CPU   : $CPU_MODEL"
+          echo "  Cores : $CORES"
+          echo "  RAM   : ${RAM_TOT} GiB total"
+          echo "  Disk  : ${DISK_TOT} GB total  [$DISK_TYPE]"
+          echo "  OS    : $OS_NAME"
+          echo "============================================"
+          echo ""
+
+          # ── Poll loop ────────────────────────────────────────────────────────
+          PAGE_SIZE=$(vm_stat | awk '/page size/{print $8}')
+
+          for i in $(seq 1 $ITERS); do
+            # RAM: (free + inactive) pages × page_size → GiB
+            ram_avail=$(vm_stat | awk -v p="$PAGE_SIZE" '
+              /Pages free:/      {gsub(/\./,"",$NF); f=$NF}
+              /Pages inactive:/  {gsub(/\./,"",$NF); n=$NF}
+              END { printf "%.2f", (f+n)*p/1073741824 }
+            ')
+
+            # CPU idle from top (user% + sys% = used%)
+            cpu_used=$(top -l 1 -n 0 | awk '/CPU usage/{
+              gsub(/[%,]/,"",$3); gsub(/[%,]/,"",$5); printf "%.1f", $3+$5 }')
+
+            disk_avail=$(df -BG / | awk 'NR==2{gsub("G","",$4); print $4}')
+
+            sum_ram=$(echo  "$sum_ram  + $ram_avail" | bc)
+            sum_cpu=$(echo  "$sum_cpu  + $cpu_used"  | bc)
+            sum_disk=$(echo "$sum_disk + $disk_avail" | bc)
+
+            echo "[$i/$ITERS] $(date '+%H:%M:%S')  RAM_avail=${ram_avail} GiB  CPU_used=${cpu_used}%  Disk_avail=${disk_avail} GB"
+            sleep 10
+          done
+
+          AVG_RAM=$(echo  "scale=2; $sum_ram  / $ITERS" | bc)
+          AVG_CPU=$(echo  "scale=1; $sum_cpu  / $ITERS" | bc)
+          AVG_DISK=$(echo "scale=1; $sum_disk / $ITERS" | bc)
+
+          echo ""
+          echo "=== macOS Averages ==="
+          echo "  Avg RAM available : ${AVG_RAM} GiB"
+          echo "  Avg CPU used      : ${AVG_CPU}%"
+          echo "  Avg Disk available: ${AVG_DISK} GB"
+
+          # ── Save JSON ────────────────────────────────────────────────────────
+          CPU_ESC=$(echo "$CPU_MODEL" | sed 's/"/\\"/g')
+          OS_ESC=$(echo  "$OS_NAME"   | sed 's/"/\\"/g')
+          cat > stats.json <<ENDJSON
+          {
+            "runner":          "macos-latest",
+            "cpu":             "$CPU_ESC",
+            "cores":           $CORES,
+            "ram_total_gib":   $RAM_TOT,
+            "disk_total_gb":   $DISK_TOT,
+            "disk_type":       "$DISK_TYPE",
+            "os":              "$OS_ESC",
+            "avg_ram_avail":   $AVG_RAM,
+            "avg_cpu_used":    $AVG_CPU,
+            "avg_disk_avail":  $AVG_DISK
+          }
+          ENDJSON
+
+      # ── Windows ──────────────────────────────────────────────────────────────
+      - name: Monitor (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ITERS   = 30
+          $sumRam  = 0.0
+          $sumCpu  = 0.0
+          $sumDisk = 0.0
+
+          # ── Baseline ─────────────────────────────────────────────────────────
+          $cpuModel = (Get-CimInstance Win32_Processor | Select-Object -First 1).Name
+          $cores    = [int]$env:NUMBER_OF_PROCESSORS
+          $ramTot   = [math]::Round(
+                        (Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 1)
+          $cDrive   = Get-PSDrive C
+          $diskTot  = [math]::Round(($cDrive.Used + $cDrive.Free) / 1GB, 0)
+          $osName   = (Get-CimInstance Win32_OperatingSystem).Caption
+
+          # SSD vs HDD
+          try {
+            $diskType = (Get-PhysicalDisk |
+                          Where-Object { $_.DeviceID -eq "0" } |
+                          Select-Object -ExpandProperty MediaType)
+            if (-not $diskType) { $diskType = "Unknown" }
+          } catch { $diskType = "Unknown" }
+
+          Write-Host "============================================"
+          Write-Host " MACHINE BASELINE (Windows)"
+          Write-Host "============================================"
+          Write-Host "  CPU   : $cpuModel"
+          Write-Host "  Cores : $cores"
+          Write-Host "  RAM   : $ramTot GiB total"
+          Write-Host "  Disk  : $diskTot GB total  [$diskType]"
+          Write-Host "  OS    : $osName"
+          Write-Host "============================================"
+          Write-Host ""
+
+          # ── Poll loop ────────────────────────────────────────────────────────
+          for ($i = 1; $i -le $ITERS; $i++) {
+            $os        = Get-CimInstance Win32_OperatingSystem
+            # FreePhysicalMemory is in KB; divide by 1048576 to get GiB
+            $ramAvail  = [math]::Round($os.FreePhysicalMemory / 1048576, 2)
+            $cpuUsed   = [math]::Round(
+                           (Get-Counter '\Processor(_Total)\% Processor Time' `
+                           ).CounterSamples.CookedValue, 1)
+            $diskAvail = [math]::Round((Get-PSDrive C).Free / 1GB, 1)
+
+            $sumRam  += $ramAvail
+            $sumCpu  += $cpuUsed
+            $sumDisk += $diskAvail
+
+            $ts = Get-Date -Format 'HH:mm:ss'
+            Write-Host "[$i/$ITERS] $ts  RAM_avail=${ramAvail} GiB  CPU_used=${cpuUsed}%  Disk_avail=${diskAvail} GB"
+            Start-Sleep -Seconds 10
+          }
+
+          $avgRam  = [math]::Round($sumRam  / $ITERS, 2)
+          $avgCpu  = [math]::Round($sumCpu  / $ITERS, 1)
+          $avgDisk = [math]::Round($sumDisk / $ITERS, 1)
+
+          Write-Host ""
+          Write-Host "=== Windows Averages ==="
+          Write-Host "  Avg RAM available : $avgRam GiB"
+          Write-Host "  Avg CPU used      : $avgCpu%"
+          Write-Host "  Avg Disk available: $avgDisk GB"
+
+          # ── Save JSON ────────────────────────────────────────────────────────
+          @{
+            runner         = "windows-latest"
+            cpu            = $cpuModel
+            cores          = $cores
+            ram_total_gib  = $ramTot
+            disk_total_gb  = $diskTot
+            disk_type      = $diskType
+            os             = $osName
+            avg_ram_avail  = $avgRam
+            avg_cpu_used   = $avgCpu
+            avg_disk_avail = $avgDisk
+          } | ConvertTo-Json | Out-File stats.json -Encoding utf8
+
+      # ── Upload artifact ──────────────────────────────────────────────────────
+      - name: Upload stats artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stats-${{ matrix.os }}
+          path: stats.json
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # SUMMARIZE — collects all three JSON results and prints a comparison table
+  # ─────────────────────────────────────────────────────────────────────────────
+  summarize:
+    needs: monitor
+    if: always()
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all stats artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: stats-*        # downloads each into its own sub-directory
+
+      - name: Print comparison table
+        shell: python3 {0}
+        run: |
+          import json, os, glob
+
+          # ── Load each stats.json ────────────────────────────────────────────
+          runners = {}
+          for path in glob.glob("stats-*/stats.json"):
+            try:
+              with open(path) as f:
+                content = f.read().strip()
+                # strip leading whitespace from heredoc lines
+                lines = [l.strip() for l in content.splitlines()]
+                d = json.loads("\n".join(lines))
+                runners[d["runner"]] = d
+            except Exception as e:
+              print(f"  Warning: could not parse {path}: {e}")
+
+          ORDER = ["ubuntu-latest", "macos-latest", "windows-latest"]
+          LABELS = {"ubuntu-latest": "Ubuntu", "macos-latest": "macOS", "windows-latest": "Windows"}
+
+          def v(runner, key, suffix=""):
+            d = runners.get(runner, {})
+            val = d.get(key, "N/A")
+            return f"{val}{suffix}" if val != "N/A" else "N/A"
+
+          def cpu_short(runner):
+            full = runners.get(runner, {}).get("cpu", "N/A")
+            # Trim long CPU names to ~30 chars
+            return full[:30] + "…" if len(full) > 31 else full
+
+          W = 34  # column width for CPU names
+
+          print()
+          print("╔══════════════════════════════╦══════════════════════╦══════════════════════╦══════════════════════╗")
+          print("║  GitHub Actions Free Runners ║       Ubuntu         ║        macOS         ║       Windows        ║")
+          print("╠══════════════════════════════╬══════════════════════╬══════════════════════╬══════════════════════╣")
+
+          rows = [
+            ("OS",                  lambda r: runners.get(r,{}).get("os","N/A")[:20]),
+            ("CPU Name",            cpu_short),
+            ("CPU Cores",           lambda r: v(r, "cores")),
+            ("Disk Type",           lambda r: v(r, "disk_type")),
+            ("RAM Total",           lambda r: v(r, "ram_total_gib", " GiB")),
+            ("Disk Total",          lambda r: v(r, "disk_total_gb",  " GB")),
+            ("─── 5-min Averages ───", None),
+            ("Avg RAM Available",   lambda r: v(r, "avg_ram_avail",  " GiB")),
+            ("Avg CPU Used",        lambda r: v(r, "avg_cpu_used",   "%")),
+            ("Avg Disk Available",  lambda r: v(r, "avg_disk_avail",  " GB")),
+          ]
+
+          for label, fn in rows:
+            if fn is None:
+              print(f"╠══════════════════════════════╬══════════════════════╬══════════════════════╬══════════════════════╣")
+              print(f"║  {label:<28}║                      ║                      ║                      ║")
+              continue
+            cols = [fn(r)[:20] for r in ORDER]
+            print(f"║  {label:<28}║  {cols[0]:<20}║  {cols[1]:<20}║  {cols[2]:<20}║")
+
+          print("╚══════════════════════════════╩══════════════════════╩══════════════════════╩══════════════════════╝")
+          print()
+
+          # ── Also emit GitHub Step Summary (shows in the Actions UI) ────────
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary_path:
+            with open(summary_path, "w") as f:
+              f.write("## 🖥️ GitHub Actions Free Runner — 5-Minute Average Stats\n\n")
+              f.write("| Metric | Ubuntu | macOS | Windows |\n")
+              f.write("|---|---|---|---|\n")
+              md_rows = [
+                ("OS",                  lambda r: runners.get(r,{}).get("os","N/A")),
+                ("CPU Name",            lambda r: runners.get(r,{}).get("cpu","N/A")),
+                ("CPU Cores",           lambda r: v(r, "cores")),
+                ("Disk Type",           lambda r: v(r, "disk_type")),
+                ("RAM Total",           lambda r: v(r, "ram_total_gib", " GiB")),
+                ("Disk Total",          lambda r: v(r, "disk_total_gb",  " GB")),
+                ("**Avg RAM Available**",  lambda r: v(r, "avg_ram_avail",  " GiB")),
+                ("**Avg CPU Used**",       lambda r: v(r, "avg_cpu_used",   "%")),
+                ("**Avg Disk Available**", lambda r: v(r, "avg_disk_avail",  " GB")),
+              ]
+              for label, fn in md_rows:
+                cols = [fn(r) for r in ORDER]
+                f.write(f"| {label} | {cols[0]} | {cols[1]} | {cols[2]} |\n")
+            print("Step summary written.")
