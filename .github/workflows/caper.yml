@@ -1,0 +1,71 @@
+name: System Stats Monitor
+on:
+  workflow_dispatch:
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Machine baseline
+        run: |
+          echo "============================================"
+          echo " MACHINE BASELINE"
+          echo "============================================"
+          echo "CPU model : $(grep 'model name' /proc/cpuinfo | head -1 | cut -d: -f2 | xargs)"
+          echo "CPU cores : $(nproc)"
+          echo "Total RAM : $(free -h | awk '/^Mem:/{print $2}')"
+          echo "Total disk: $(df -h / | awk 'NR==2{print $2}')"
+          echo "OS        : $(lsb_release -ds)"
+          echo "Kernel    : $(uname -r)"
+          echo "============================================"
+
+      - name: Poll every 10s for 5 minutes
+        run: |
+          ITERATIONS=30   # 30 x 10s = 5 minutes
+
+          for i in $(seq 1 $ITERATIONS); do
+
+            echo ""
+            echo "--------------------------------------------"
+            echo " Poll $i / $ITERATIONS    $(date '+%H:%M:%S')"
+            echo "--------------------------------------------"
+
+            # ── RAM ──────────────────────────────────────
+            echo ""
+            echo "[RAM]"
+            free -h
+            echo ""
+            echo "[RAM DETAIL]"
+            awk '/^(MemTotal|MemFree|MemAvailable|Buffers|Cached|SwapTotal|SwapFree|SwapCached):/ \
+              {printf "  %-20s %8s kB\n", $1, $2}' /proc/meminfo
+
+            # ── CPU ──────────────────────────────────────
+            echo ""
+            echo "[CPU]"
+            echo "  Load avg (1m 5m 15m) : $(cut -d' ' -f1-3 /proc/loadavg)"
+            top -bn1 | grep "^%Cpu" | sed 's/^/  /'
+            echo "  Running processes    : $(ps aux | wc -l)"
+
+            # ── STORAGE ──────────────────────────────────
+            echo ""
+            echo "[STORAGE]"
+            df -h --output=source,size,used,avail,pcent,target \
+              | grep -v "^tmpfs\|^overlay\|^udev\|^/dev/loop\|Filesystem"
+            echo ""
+            echo "  /tmp usage : $(du -sh /tmp 2>/dev/null | cut -f1)"
+            echo "  /home usage: $(du -sh /home 2>/dev/null | cut -f1)"
+
+            # ── SWAP ─────────────────────────────────────
+            echo ""
+            echo "[SWAP]"
+            swapon --show 2>/dev/null || echo "  none"
+
+            sleep 10
+          done
+
+          echo ""
+          echo "============================================"
+          echo " Monitor done — 5 minutes complete"
+          echo "============================================"
