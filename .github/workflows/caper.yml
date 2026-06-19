@@ -105,10 +105,14 @@ jobs:
           sum_ram=0; sum_cpu=0; sum_disk=0
 
           # ── Baseline ─────────────────────────────────────────────────────────
-          CPU_MODEL=$(sysctl -n machdep.cpu.brand_string)
+          # machdep.cpu.brand_string = Intel; Apple Silicon uses hw.model
+          CPU_MODEL=$(sysctl -n machdep.cpu.brand_string 2>/dev/null \
+                      || sysctl -n hw.model 2>/dev/null \
+                      || echo "Unknown")
           CORES=$(sysctl -n hw.logicalcpu)
           RAM_TOT=$(sysctl -n hw.memsize | awk '{printf "%.1f",$1/1073741824}')
-          DISK_TOT=$(df -BG / | awk 'NR==2{gsub("G","",$2); print $2}')
+          # macOS df uses -g (gigabyte blocks) — NOT -BG which is Linux-only
+          DISK_TOT=$(df -g / | awk 'NR==2{print $2}')
           OS_NAME="macOS $(sw_vers -productVersion)"
 
           # SSD detection via diskutil
@@ -144,7 +148,8 @@ jobs:
             cpu_used=$(top -l 1 -n 0 | awk '/CPU usage/{
               gsub(/[%,]/,"",$3); gsub(/[%,]/,"",$5); printf "%.1f", $3+$5 }')
 
-            disk_avail=$(df -BG / | awk 'NR==2{gsub("G","",$4); print $4}')
+            # macOS df: use -g for GB blocks; $4 = available
+            disk_avail=$(df -g / | awk 'NR==2{print $4}')
 
             sum_ram=$(echo  "$sum_ram  + $ram_avail" | bc)
             sum_cpu=$(echo  "$sum_cpu  + $cpu_used"  | bc)
