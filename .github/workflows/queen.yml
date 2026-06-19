@@ -1,0 +1,40 @@
+name: Parallel Processes in One Job
+
+on:
+  workflow_dispatch:
+
+jobs:
+
+  parallel_in_one_job:
+    runs-on: ubuntu-latest
+    
+    # Allow up to 4 processes to run simultaneously within this one job
+    strategy:
+      max-parallel: 4
+        
+    steps:
+    
+      - uses: actions/checkout@v4
+      
+      - name: Run 4 processes in parallel
+        env:
+          SLEEP_TIME: 30
+        run: |
+          # Define the commands to run in parallel  
+          commands=(
+            "echo 'Running process 1' && sleep ${SLEEP_TIME}s && echo 'Process 1 done'"
+            "echo 'Running process 2' && sleep ${SLEEP_TIME}s && echo 'Process 2 done'" 
+            "echo 'Running process 3' && sleep ${SLEEP_TIME}s && echo 'Process 3 done'"
+            "echo 'Running process 4' && sleep ${SLEEP_TIME}s && echo 'Process 4 done'"
+          )
+
+          # Run commands in parallel as background processes
+          for cmd in "${commands[@]}"; do
+            ( 
+              (eval "$cmd") &
+            )   
+          done
+
+          # Wait for all processes to finish  
+          wait
+          echo "All processes completed"
